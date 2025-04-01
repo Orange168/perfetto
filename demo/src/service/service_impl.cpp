@@ -93,10 +93,6 @@ bool ServiceImpl::StartTracing(const TraceSessionConfig& config) {
         }
     }
     
-    // 准备发送给生产者的命令
-    MessageHeader header;
-    header.message_type = ENABLE_TRACING;
-    
     // 序列化配置
     std::stringstream ss;
     ss << config.name << "\n";
@@ -104,7 +100,6 @@ bool ServiceImpl::StartTracing(const TraceSessionConfig& config) {
     ss << config.duration_ms << "\n";
     
     std::string config_str = ss.str();
-    header.payload_size = config_str.size();
     
     // 向所有生产者发送启动命令
     {
@@ -165,10 +160,6 @@ bool ServiceImpl::StopTracing() {
     std::cout << "Stopping tracing session" << std::endl;
     
     // 向所有生产者发送停止命令
-    MessageHeader header;
-    header.message_type = DISABLE_TRACING;
-    header.payload_size = 0;
-    
     {
         std::lock_guard<std::mutex> lock(clients_mutex_);
         for (auto& client : clients_) {

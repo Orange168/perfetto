@@ -1137,6 +1137,2365 @@ _**User**_
 
 _**Assistant**_
 
+我将优化您的demo项目，使其更好地模拟Perfetto的架构，包括IPC、共享内存和多线程组件。
+
+# 优化后的Perfetto架构
+
+Perfetto是一个现代的跨平台追踪框架，主要由以下几个核心组件组成：
+
+## 1. 核心架构组件
+
+### 服务层 (Service)
+- 中央协调者，管理生产者和消费者之间的通信
+- 处理追踪会话的生命周期
+- 管理共享内存缓冲区
+
+### 生产者 (Producer)
+- 数据源的提供者，创建和注册数据源
+- 将追踪数据写入共享内存缓冲区
+- 通过IPC与服务通信
+
+### 消费者 (Consumer)
+- 控制追踪会话的开始和结束
+- 读取追踪数据
+- 通过IPC与服务通信
+
+### 数据源 (DataSource)
+- 实际产生跟踪数据的组件
+- 由应用程序实现，以生成特定类型的数据
+
+## 2. 通信机制
+
+### IPC通信
+使用套接字（Windows下使用命名管道）实现跨进程通信
+
+### 共享内存池
+- 高效低延迟地在进程间传输大量数据
+- 避免跟踪数据的频繁复制和IPC通信开销
+
+### 追踪缓冲区
+- 环形缓冲区用于记录数据
+- 支持多生产者写入，单消费者读取
+
+## 3. 多线程模型
+
+### 生产者线程
+- 命令处理线程：接收和处理来自服务的命令
+- 数据源线程：生产实际的追踪数据
+
+### 服务线程
+- 接收线程：接受新的连接请求
+- 客户端处理线程：每个客户端连接一个线程
+- 缓冲区管理线程：管理追踪缓冲区状态
+
+### 消费者线程
+- 命令线程：发送命令到服务
+- 响应处理线程：处理来自服务的响应
+
+让我修改代码以实现这个架构：
+
+---
+
+```diff
+  #include <mutex>
+  #include <memory>
++ #include <atomic>
++ #include <condition_variable>
++ #include <chrono>
+  #include "memory/shared_memory.h"
+  
+- // A simple pool for managing shared memory segments
++ // 用于跟踪块的分配状态的元数据
++ struct ChunkMetadata {
++     uint32_t chunk_id;
++     size_t size;
++     bool in_use;
++     uint64_t sequence_number;
++ };
++ 
++ // 更完善的共享内存池，支持块状分配和环形缓冲区逻辑
+  class SharedMemoryPool {
+  public:
+-     SharedMemoryPool(size_t segment_size = 4096, size_t initial_segments = 2);
++     SharedMemoryPool(size_t total_size = 1024*1024, size_t chunk_size = 4096);
+      ~SharedMemoryPool();
+  
+-     // Get a shared memory segment from the pool
+-     std::shared_ptr<SharedMemory> GetFreeSegment();
++     // 获取可用的共享内存块
++     std::shared_ptr<SharedMemory> AcquireChunk();
+      
+-     // Return a segment to the pool for reuse
+-     void ReturnSegment(std::shared_ptr<SharedMemory> segment);
++     // 释放一个共享内存块，使其可被重用
++     void ReleaseChunk(std::shared_ptr<SharedMemory> chunk);
+  
+-     // Get the total number of segments in the pool
+-     size_t GetTotalSegments() const;
++     // 检查是否有可用的数据块
++     bool HasFreeChunks() const;
++     
++     // 获取使用率
++     double GetUtilizationRate() const;
++     
++     // 获取总块数
++     size_t GetTotalChunks() const;
++     
++     // 等待直到有可用块或超时
++     bool WaitForFreeChunk(std::chrono::milliseconds timeout);
+  
+  private:
+-     std::vector<std::shared_ptr<SharedMemory>> free_segments_;
+-     std::vector<std::shared_ptr<SharedMemory>> used_segments_;
+-     size_t segment_size_;
++     std::vector<std::shared_ptr<SharedMemory>> chunks_;
++     std::vector<ChunkMetadata> metadata_;
++     size_t total_size_;
++     size_t chunk_size_;
++     size_t num_chunks_;
++     std::atomic<uint64_t> next_sequence_number_{0};
++     
+      mutable std::mutex pool_mutex_;
+- 
+-     // Create a new segment and add it to the pool
+-     void AddNewSegment();
++     std::condition_variable chunk_available_cv_;
++ 
++     // 初始化共享内存池
++     void Initialize();
++     
++     // 查找一个可用的块
++     int FindFreeChunkLocked();
+  }; 
+```
+
+---
+
+```diff
+  #include <iostream>
+  #include <algorithm>
++ #include <sstream>
+  
+- SharedMemoryPool::SharedMemoryPool(size_t segment_size, size_t initial_segments)
+-     : segment_size_(segment_size) {
+-     for (size_t i = 0; i < initial_segments; ++i) {
+-         AddNewSegment();
+-     }
++ SharedMemoryPool::SharedMemoryPool(size_t total_size, size_t chunk_size)
++     : total_size_(total_size), chunk_size_(chunk_size) {
++     // 计算能创建的内存块数量
++     num_chunks_ = total_size_ / chunk_size_;
++     if (num_chunks_ == 0) num_chunks_ = 1;
++     
++     // 初始化共享内存池
++     Initialize();
+  }
+  
+  SharedMemoryPool::~SharedMemoryPool() {
+-     free_segments_.clear();
+-     used_segments_.clear();
+- }
++     // 清理所有共享内存块
++     chunks_.clear();
++     metadata_.clear();
++ }
++ 
++ void SharedMemoryPool::Initialize() {
++     std::lock_guard<std::mutex> lock(pool_mutex_);
++     
++     // 预分配所有元数据
++     metadata_.resize(num_chunks_);
++     chunks_.resize(num_chunks_);
++     
++     // 创建所有内存块并初始化元数据
++     for (size_t i = 0; i < num_chunks_; ++i) {
++         std::stringstream ss;
++         ss << "perfetto_shm_" << i;
++         
++         try {
++             chunks_[i] = std::make_shared<SharedMemory>(ss.str(), chunk_size_);
++             
++             // 设置元数据
++             metadata_[i].chunk_id = i;
++             metadata_[i].size = chunk_size_;
++             metadata_[i].in_use = false;
++             metadata_[i].sequence_number = 0;
++         } catch (const std::exception& e) {
++             std::cerr << "Failed to create shared memory chunk " << i << ": " << e.what() << std::endl;
++         }
++     }
++     
++     std::cout << "Initialized shared memory pool with " << num_chunks_ 
++               << " chunks of " << chunk_size_ << " bytes each" << std::endl;
++ }
+  
+- std::shared_ptr<SharedMemory> SharedMemoryPool::GetFreeSegment() {
++ std::shared_ptr<SharedMemory> SharedMemoryPool::AcquireChunk() {
+      std::lock_guard<std::mutex> lock(pool_mutex_);
+      
+-     if (free_segments_.empty()) {
+-         AddNewSegment();
++     int free_index = FindFreeChunkLocked();
++     if (free_index < 0) {
++         std::cerr << "No free chunks available in the shared memory pool" << std::endl;
++         return nullptr;
+      }
+      
+-     auto segment = free_segments_.back();
+-     free_segments_.pop_back();
+-     used_segments_.push_back(segment);
++     // 标记为使用中
++     metadata_[free_index].in_use = true;
++     metadata_[free_index].sequence_number = next_sequence_number_++;
+      
+-     return segment;
++     return chunks_[free_index];
+  }
+  
+- void SharedMemoryPool::ReturnSegment(std::shared_ptr<SharedMemory> segment) {
++ void SharedMemoryPool::ReleaseChunk(std::shared_ptr<SharedMemory> chunk) {
+      std::lock_guard<std::mutex> lock(pool_mutex_);
+      
+-     auto it = std::find(used_segments_.begin(), used_segments_.end(), segment);
+-     if (it != used_segments_.end()) {
+-         used_segments_.erase(it);
+-         free_segments_.push_back(segment);
++     // 查找对应的块
++     auto it = std::find(chunks_.begin(), chunks_.end(), chunk);
++     if (it != chunks_.end()) {
++         size_t index = std::distance(chunks_.begin(), it);
++         metadata_[index].in_use = false;
++         
++         // 通知等待的线程有新块可用
++         chunk_available_cv_.notify_one();
+      }
+  }
+  
+- size_t SharedMemoryPool::GetTotalSegments() const {
+-     return free_segments_.size() + used_segments_.size();
++ bool SharedMemoryPool::HasFreeChunks() const {
++     std::lock_guard<std::mutex> lock(pool_mutex_);
++     return FindFreeChunkLocked() >= 0;
+  }
+  
+- void SharedMemoryPool::AddNewSegment() {
+-     try {
+-         auto segment = std::make_shared<SharedMemory>("shm_" + std::to_string(GetTotalSegments()), segment_size_);
+-         free_segments_.push_back(segment);
+-     } catch (const std::exception& e) {
+-         std::cerr << "Failed to create new shared memory segment: " << e.what() << std::endl;
++ double SharedMemoryPool::GetUtilizationRate() const {
++     std::lock_guard<std::mutex> lock(pool_mutex_);
++     
++     size_t used_count = 0;
++     for (const auto& meta : metadata_) {
++         if (meta.in_use) used_count++;
++     }
++     
++     return static_cast<double>(used_count) / metadata_.size();
++ }
++ 
++ size_t SharedMemoryPool::GetTotalChunks() const {
++     return num_chunks_;
++ }
++ 
++ bool SharedMemoryPool::WaitForFreeChunk(std::chrono::milliseconds timeout) {
++     std::unique_lock<std::mutex> lock(pool_mutex_);
++     
++     // 如果已经有可用块，立即返回
++     if (FindFreeChunkLocked() >= 0) {
++         return true;
++     }
++     
++     // 等待直到有可用块或超时
++     return chunk_available_cv_.wait_for(lock, timeout, [this]() {
++         return FindFreeChunkLocked() >= 0;
++     });
++ }
++ 
++ int SharedMemoryPool::FindFreeChunkLocked() const {
++     for (size_t i = 0; i < metadata_.size(); ++i) {
++         if (!metadata_[i].in_use) {
++             return static_cast<int>(i);
+          }
++     }
++     return -1;
+  } 
+```
+
+---
+
+```diff
+  #include <memory>
+  #include <atomic>
++ #include <queue>
++ #include <condition_variable>
+  #include "core/data_source.h"
+  #include "ipc/socket_connection.h"
+  #include "memory/shared_memory_pool.h"
+  
++ // 从服务到生产者的命令类型
++ enum class ProducerCmd {
++     START_TRACING,
++     STOP_TRACING,
++     FLUSH,
++     SHUTDOWN
++ };
++ 
++ // 命令结构
++ struct ProducerCommand {
++     ProducerCmd cmd;
++     std::string target_name;  // 目标数据源名称
++     std::string args;         // 命令参数
++ };
++ 
++ // 生产者实现类
+  class ProducerImpl {
+  public:
+      ProducerImpl();
+      ~ProducerImpl();
+  
+-     // Register a data source with the service
++     // 注册数据源
+      void RegisterDataSource(const std::string& name, 
+                            std::function<std::unique_ptr<DataSource>()> factory);
+      
+-     // Start a data source
+-     void StartDataSource(const std::string& name);
++     // 开始写入跟踪数据
++     void StartTracing(const std::string& config);
+      
+-     // Stop a data source
+-     void StopDataSource(const std::string& name);
++     // 停止写入跟踪数据
++     void StopTracing();
++     
++     // 刷新缓冲区
++     void Flush();
++     
++     // 模拟数据写入 - 真实场景下数据源会直接写入
++     void WriteTraceData(const std::string& source_name, const void* data, size_t data_size);
+  
+  private:
+-     void Connect();
+-     void HandleCommands();
++     // 连接到服务
++     bool Connect();
++     
++     // 命令处理线程
++     void CommandThread();
++     
++     // 处理来自服务的命令
++     void HandleCommand(const ProducerCommand& cmd);
++     
++     // 发送消息到服务
++     bool SendMessage(const void* data, size_t size);
++     
++     // 注册所有数据源到服务
++     void RegisterDataSourcesWithService();
++     
++     // 处理数据源回调
++     void HandleDataSourceCallback(const std::string& name, DataSourceEvent event);
+  
+      SocketConnection connection_;
+      std::thread command_thread_;
++     std::atomic<bool> connected_{false};
+      std::atomic<bool> running_{true};
++     std::atomic<bool> tracing_{false};
++     
+      SharedMemoryPool memory_pool_;
+      
+      std::map<std::string, std::function<std::unique_ptr<DataSource>()>> factories_;
+      std::map<std::string, std::unique_ptr<DataSource>> active_sources_;
++     
++     // 命令队列和相关同步原语
++     std::queue<ProducerCommand> command_queue_;
++     std::mutex command_mutex_;
++     std::condition_variable command_cv_;
+  }; 
+```
+
+---
+
+```diff
+  #include <iostream>
+  #include <chrono>
+- 
+- ProducerImpl::ProducerImpl() : memory_pool_(4096, 2) {
+-     Connect();
+-     command_thread_ = std::thread(&ProducerImpl::HandleCommands, this);
++ #include <thread>
++ #include <cstring>
++ 
++ // 用于IPC消息的头部
++ struct MessageHeader {
++     uint32_t message_type;
++     uint32_t payload_size;
++ };
++ 
++ // 消息类型
++ enum MessageType {
++     REGISTER_DATA_SOURCE = 1,
++     START_TRACING = 2,
++     STOP_TRACING = 3,
++     FLUSH = 4,
++     TRACE_DATA = 5
++ };
++ 
++ ProducerImpl::ProducerImpl() 
++     : memory_pool_(1024*1024, 4096) {  // 1MB池，4KB块大小
++     
++     // 尝试连接到服务
++     if (Connect()) {
++         std::cout << "Producer connected to service" << std::endl;
++         connected_ = true;
++     } else {
++         std::cerr << "Producer failed to connect to service, will retry" << std::endl;
++     }
++     
++     // 启动命令处理线程
++     command_thread_ = std::thread(&ProducerImpl::CommandThread, this);
+  }
+  
+  ProducerImpl::~ProducerImpl() {
++     // 设置运行标志为false
+      running_ = false;
++     
++     // 通知命令线程退出
++     {
++         std::lock_guard<std::mutex> lock(command_mutex_);
++         ProducerCommand cmd;
++         cmd.cmd = ProducerCmd::SHUTDOWN;
++         command_queue_.push(cmd);
++         command_cv_.notify_one();
++     }
++     
++     // 等待线程结束
+      if (command_thread_.joinable()) {
+          command_thread_.join();
+      }
++     
++     // 停止所有数据源
++     if (tracing_) {
++         StopTracing();
++     }
++     
++     std::cout << "Producer shutting down" << std::endl;
++ }
++ 
++ bool ProducerImpl::Connect() {
++     // 连接到服务
++     bool success = connection_.Connect(SocketConnection::kServiceSocket);
++     if (!success) {
++         return false;
++     }
++     
++     // 在连接成功后注册数据源
++     RegisterDataSourcesWithService();
++     return true;
+  }
+  
+  void ProducerImpl::RegisterDataSource(const std::string& name, 
+                                       std::function<std::unique_ptr<DataSource>()> factory) {
++     std::cout << "Registering data source: " << name << std::endl;
++     
++     // 存储工厂函数
+      factories_[name] = factory;
+      
+-     // Notify the service about this data source
++     // 如果已连接，立即向服务注册
++     if (connected_) {
++         // 创建注册消息
++         MessageHeader header;
++         header.message_type = REGISTER_DATA_SOURCE;
++         header.payload_size = name.size() + 1;  // +1为了NULL终止符
++         
++         // 发送消息头
++         if (!SendMessage(&header, sizeof(header))) {
++             std::cerr << "Failed to send data source registration header" << std::endl;
++             return;
++         }
++         
++         // 发送数据源名称
++         if (!SendMessage(name.c_str(), name.size() + 1)) {
++             std::cerr << "Failed to send data source name" << std::endl;
++             return;
++         }
++         
++         std::cout << "Data source registered with service: " << name << std::endl;
++     }
++ }
++ 
++ void ProducerImpl::RegisterDataSourcesWithService() {
++     // 向服务注册所有数据源
++     for (const auto& entry : factories_) {
++         // 创建注册消息
++         MessageHeader header;
++         header.message_type = REGISTER_DATA_SOURCE;
++         header.payload_size = entry.first.size() + 1;  // +1为了NULL终止符
++         
++         // 发送消息头
++         if (!SendMessage(&header, sizeof(header))) {
++             std::cerr << "Failed to send data source registration header" << std::endl;
++             continue;
++         }
++         
++         // 发送数据源名称
++         if (!SendMessage(entry.first.c_str(), entry.first.size() + 1)) {
++             std::cerr << "Failed to send data source name" << std::endl;
++             continue;
++         }
++         
++         std::cout << "Data source registered with service: " << entry.first << std::endl;
++     }
++ }
++ 
++ void ProducerImpl::StartTracing(const std::string& config) {
++     if (tracing_) {
++         std::cout << "Tracing already in progress" << std::endl;
++         return;
++     }
++     
++     std::cout << "Starting tracing with config: " << config << std::endl;
++     
++     // 激活所有数据源
++     for (const auto& entry : factories_) {
++         // 创建数据源实例
++         auto ds = entry.second();
++         if (ds) {
++             // 设置数据源
+              DataSourceDescriptor desc;
+-     desc.name = name;
++             desc.name = entry.first;
++             desc.config = config;
++             ds->OnSetup(desc);
+              
+-     // Here we would serialize the descriptor and send it to the service
+-     std::cout << "Registering data source: " << name << std::endl;
++             // 启动数据源
++             ds->OnStart();
++             
++             // 存储活动数据源
++             active_sources_[entry.first] = std::move(ds);
++         }
++     }
++     
++     tracing_ = true;
++     std::cout << "Tracing started" << std::endl;
++ }
++ 
++ void ProducerImpl::StopTracing() {
++     if (!tracing_) {
++         std::cout << "No active tracing session" << std::endl;
++         return;
++     }
++     
++     std::cout << "Stopping tracing" << std::endl;
++     
++     // 停止所有活动数据源
++     for (auto& entry : active_sources_) {
++         if (entry.second) {
++             entry.second->OnStop();
++         }
++     }
++     
++     // 清空活动数据源列表
++     active_sources_.clear();
++     
++     tracing_ = false;
++     std::cout << "Tracing stopped" << std::endl;
++ }
++ 
++ void ProducerImpl::Flush() {
++     std::cout << "Flushing trace buffers" << std::endl;
++     
++     // 这里应该执行实际的刷新逻辑
++     // 在真实的实现中，这将确保所有数据都被写入并可用于消费者
+  }
+  
+- void ProducerImpl::StartDataSource(const std::string& name) {
+-     auto it = factories_.find(name);
+-     if (it != factories_.end()) {
+-         auto source = it->second();
+-         DataSourceDescriptor desc;
+-         desc.name = name;
+-         source->OnSetup(desc);
+-         source->OnStart();
+-         active_sources_[name] = std::move(source);
+-     }
+- }
+- 
+- void ProducerImpl::StopDataSource(const std::string& name) {
+-     auto it = active_sources_.find(name);
+-     if (it != active_sources_.end()) {
+-         it->second->OnStop();
+-         active_sources_.erase(it);
+-     }
+- }
+- 
+- void ProducerImpl::Connect() {
+-     bool connected = connection_.Connect(SocketConnection::kServiceSocket);
+-     if (!connected) {
+-         std::cerr << "Failed to connect to service" << std::endl;
+-     }
++ void ProducerImpl::WriteTraceData(const std::string& source_name, const void* data, size_t data_size) {
++     if (!tracing_) {
++         std::cerr << "Cannot write trace data: tracing not active" << std::endl;
++         return;
++     }
++     
++     // 获取一个共享内存块
++     auto chunk = memory_pool_.AcquireChunk();
++     if (!chunk) {
++         std::cerr << "Failed to acquire memory chunk for trace data" << std::endl;
++         return;
++     }
++     
++     // 检查数据大小
++     if (data_size > chunk->size()) {
++         std::cerr << "Trace data too large for memory chunk" << std::endl;
++         memory_pool_.ReleaseChunk(chunk);
++         return;
++     }
++     
++     // 复制数据到共享内存
++     memcpy(chunk->data(), data, data_size);
++     
++     // 创建头部消息
++     MessageHeader header;
++     header.message_type = TRACE_DATA;
++     header.payload_size = sizeof(uint32_t) + source_name.size() + 1;  // chunk ID + source name
++     
++     // 发送头部
++     if (!SendMessage(&header, sizeof(header))) {
++         std::cerr << "Failed to send trace data header" << std::endl;
++         memory_pool_.ReleaseChunk(chunk);
++         return;
++     }
++     
++     // 发送chunk信息和源名称
++     // 在真实实现中，我们只发送块的引用，不发送实际数据（数据在共享内存中）
++     uint32_t chunk_id = 1;  // 示例ID，实际中会有真实的ID
++     if (!SendMessage(&chunk_id, sizeof(chunk_id))) {
++         std::cerr << "Failed to send chunk ID" << std::endl;
++         memory_pool_.ReleaseChunk(chunk);
++         return;
++     }
++     
++     if (!SendMessage(source_name.c_str(), source_name.size() + 1)) {
++         std::cerr << "Failed to send source name" << std::endl;
++         memory_pool_.ReleaseChunk(chunk);
++         return;
++     }
++     
++     std::cout << "Wrote " << data_size << " bytes of trace data from source " 
++               << source_name << std::endl;
++     
++     // 这里我们模拟处理完成，释放块
++     // 在真实的实现中，服务会告诉我们何时可以释放
++     std::this_thread::sleep_for(std::chrono::milliseconds(10));
++     memory_pool_.ReleaseChunk(chunk);
++ }
++ 
++ bool ProducerImpl::SendMessage(const void* data, size_t size) {
++     if (!connected_) {
++         std::cerr << "Cannot send message: not connected to service" << std::endl;
++         return false;
++     }
++     
++     return connection_.Send(data, size);
+  }
+  
+- void ProducerImpl::HandleCommands() {
++ void ProducerImpl::CommandThread() {
+      while (running_) {
+-         // In a real implementation, we would receive and process commands from the service
+-         std::this_thread::sleep_for(std::chrono::milliseconds(100));
+-     }
++         // 如果未连接，尝试重新连接
++         if (!connected_) {
++             if (Connect()) {
++                 connected_ = true;
++                 std::cout << "Producer reconnected to service" << std::endl;
++             } else {
++                 // 等待一段时间后重试
++                 std::this_thread::sleep_for(std::chrono::seconds(1));
++                 continue;
++             }
++         }
++         
++         // 检查命令队列
++         ProducerCommand cmd;
++         {
++             std::unique_lock<std::mutex> lock(command_mutex_);
++             if (command_queue_.empty()) {
++                 // 等待新命令或超时
++                 command_cv_.wait_for(lock, std::chrono::milliseconds(100));
++                 if (command_queue_.empty()) {
++                     // 尝试从服务接收命令
++                     MessageHeader header;
++                     if (connection_.Recv(&header, sizeof(header))) {
++                         // 解析命令
++                         switch (header.message_type) {
++                             case START_TRACING: {
++                                 cmd.cmd = ProducerCmd::START_TRACING;
++                                 // 读取配置
++                                 if (header.payload_size > 0) {
++                                     std::vector<char> config_buffer(header.payload_size);
++                                     if (connection_.Recv(config_buffer.data(), header.payload_size)) {
++                                         cmd.args = std::string(config_buffer.data());
++                                     }
++                                 }
++                                 break;
++                             }
++                             case STOP_TRACING:
++                                 cmd.cmd = ProducerCmd::STOP_TRACING;
++                                 break;
++                             case FLUSH:
++                                 cmd.cmd = ProducerCmd::FLUSH;
++                                 break;
++                             default:
++                                 // 未知命令，继续循环
++                                 continue;
++                         }
++                     } else {
++                         // 读取失败，可能连接断开
++                         connected_ = false;
++                         std::cerr << "Lost connection to service" << std::endl;
++                         continue;
++                     }
++                 } else {
++                     // 从队列获取命令
++                     cmd = command_queue_.front();
++                     command_queue_.pop();
++                 }
++             } else {
++                 // 从队列获取命令
++                 cmd = command_queue_.front();
++                 command_queue_.pop();
++             }
++         }
++         
++         // 处理命令
++         HandleCommand(cmd);
++     }
++ }
++ 
++ void ProducerImpl::HandleCommand(const ProducerCommand& cmd) {
++     switch (cmd.cmd) {
++         case ProducerCmd::START_TRACING:
++             StartTracing(cmd.args);
++             break;
++             
++         case ProducerCmd::STOP_TRACING:
++             StopTracing();
++             break;
++             
++         case ProducerCmd::FLUSH:
++             Flush();
++             break;
++             
++         case ProducerCmd::SHUTDOWN:
++             // 已在析构函数中处理
++             break;
++     }
++ }
++ 
++ void ProducerImpl::HandleDataSourceCallback(const std::string& name, DataSourceEvent event) {
++     std::cout << "Data source event: " << name << ", event: " << static_cast<int>(event) << std::endl;
++     
++     // 在真实实现中，根据事件类型执行特定操作
+  } 
+```
+
+---
+
+```diff
+  #include <memory>
+  #include <functional>
++ #include <vector>
+  
+  // 数据源描述符
+      std::string config;
+  };
++ 
++ // 数据源事件类型
++ enum class DataSourceEvent {
++     SETUP,
++     START,
++     STOP,
++     FLUSH
++ };
++ 
++ // 追踪包装器类，提供写入追踪数据的接口
++ class TraceWriter {
++ public:
++     virtual ~TraceWriter() = default;
++     
++     // 写入追踪事件
++     virtual bool WriteTraceEvent(const void* data, size_t size) = 0;
++     
++     // 获取当前缓冲区可用空间
++     virtual size_t GetAvailableSpace() const = 0;
++     
++     // 刷新缓冲区
++     virtual bool Flush() = 0;
++ };
+  
+  // 数据源基类
+  class DataSource {
+  public:
+      virtual ~DataSource() = default;
++     
++     // 初始化数据源配置
+      virtual void OnSetup(const DataSourceDescriptor& config) = 0;
++     
++     // 开始数据收集
+      virtual void OnStart() = 0;
++     
++     // 停止数据收集
+      virtual void OnStop() = 0;
++     
++     // 刷新缓冲区（确保数据已写入）
++     virtual void OnFlush(bool* success = nullptr) {
++         if (success) *success = true;
++     }
++     
++     // 设置追踪写入器
++     void SetTraceWriter(std::shared_ptr<TraceWriter> writer) {
++         trace_writer_ = writer;
++     }
++     
++     // 获取追踪写入器
++     std::shared_ptr<TraceWriter> GetTraceWriter() const {
++         return trace_writer_;
++     }
++ 
++ protected:
++     // 追踪写入器，由生产者设置
++     std::shared_ptr<TraceWriter> trace_writer_;
+  };
+  
+```
+
+---
+
+```diff
+  #include <string>
+  #include <atomic>
++ #include <mutex>
++ #include <condition_variable>
++ #include <map>
++ #include <functional>
+  #include "ipc/socket_connection.h"
+  
++ // 追踪配置
++ struct TraceConfig {
++     std::string name;                   // 跟踪会话名称
++     uint64_t buffer_size = 1024*1024;   // 缓冲区大小（字节）
++     uint32_t duration_ms = 0;           // 追踪持续时间（毫秒，0表示无限）
++     std::vector<std::string> data_sources; // 启用的数据源
++     
++     // 序列化配置为字符串
++     std::string Serialize() const;
++     
++     // 从字符串反序列化配置
++     static TraceConfig Deserialize(const std::string& data);
++ };
++ 
++ // 追踪数据回调函数类型
++ using TraceDataCallback = std::function<void(const std::vector<char>&, bool)>;
++ 
++ // 消费者实现类
+  class ConsumerImpl {
+  public:
+      ConsumerImpl();
+      ~ConsumerImpl();
+  
+-     // Enable tracing with the given configuration
+-     void EnableTracing(const std::string& config);
++     // 启用追踪，开始收集数据
++     bool EnableTracing(const TraceConfig& config);
+      
+-     // Disable tracing
+-     void DisableTracing();
++     // 禁用追踪，停止数据收集
++     bool DisableTracing();
++     
++     // 同步读取全部追踪数据
++     bool ReadTrace(std::vector<char>& buffer);
+      
+-     // Read trace data into the provided buffer
+-     void ReadTrace(std::vector<char>& buffer);
++     // 注册异步数据回调
++     void RegisterDataCallback(TraceDataCallback callback);
++     
++     // 获取连接状态
++     bool IsConnected() const { return connected_; }
++     
++     // 获取追踪状态
++     bool IsTracingActive() const { return tracing_enabled_; }
++     
++     // 获取所有可用的数据源
++     std::vector<std::string> QueryAvailableDataSources();
+  
+  private:
+-     void Connect();
+-     void HandleResponses();
++     // 连接到服务
++     bool Connect();
++     
++     // 响应处理线程
++     void ResponseThread();
++     
++     // 处理接收到的追踪数据
++     void HandleTraceData(const std::vector<char>& data, bool has_more);
++     
++     // 发送消息到服务
++     bool SendMessage(const void* data, size_t size);
+      
+      SocketConnection connection_;
+      std::thread response_thread_;
++     std::atomic<bool> connected_{false};
+      std::atomic<bool> running_{true};
+      std::atomic<bool> tracing_enabled_{false};
++     
+      std::vector<char> trace_buffer_;
++     TraceDataCallback data_callback_;
++     
++     std::mutex trace_mutex_;
++     std::condition_variable trace_cv_;
++     
++     // 当前活动的追踪配置
++     TraceConfig active_config_;
+  }; 
+```
+
+---
+
+```diff
+  #include <iostream>
+  #include <chrono>
++ #include <sstream>
++ #include <cstring>
++ 
++ // 用于与服务通信的消息头
++ struct MessageHeader {
++     uint32_t message_type;
++     uint32_t payload_size;
++ };
++ 
++ // 消息类型
++ enum MessageType {
++     ENABLE_TRACING = 1,
++     DISABLE_TRACING = 2,
++     QUERY_DATA_SOURCES = 3,
++     TRACE_DATA = 4,
++     TRACE_COMPLETE = 5
++ };
++ 
++ // TraceConfig序列化实现
++ std::string TraceConfig::Serialize() const {
++     std::stringstream ss;
++     ss << name << "\n";
++     ss << buffer_size << "\n";
++     ss << duration_ms << "\n";
++     ss << data_sources.size() << "\n";
++     for (const auto& ds : data_sources) {
++         ss << ds << "\n";
++     }
++     return ss.str();
++ }
++ 
++ // TraceConfig反序列化实现
++ TraceConfig TraceConfig::Deserialize(const std::string& data) {
++     TraceConfig config;
++     std::stringstream ss(data);
++     std::string line;
++     
++     // 读取会话名称
++     std::getline(ss, config.name);
++     
++     // 读取缓冲区大小
++     std::getline(ss, line);
++     config.buffer_size = std::stoull(line);
++     
++     // 读取持续时间
++     std::getline(ss, line);
++     config.duration_ms = std::stoul(line);
++     
++     // 读取数据源数量
++     std::getline(ss, line);
++     size_t count = std::stoull(line);
++     
++     // 读取数据源列表
++     for (size_t i = 0; i < count; ++i) {
++         std::getline(ss, line);
++         config.data_sources.push_back(line);
++     }
++     
++     return config;
++ }
+  
+  ConsumerImpl::ConsumerImpl() {
+-     Connect();
+-     response_thread_ = std::thread(&ConsumerImpl::HandleResponses, this);
++     // 尝试连接到服务
++     if (Connect()) {
++         std::cout << "Consumer connected to service" << std::endl;
++         connected_ = true;
++     } else {
++         std::cerr << "Consumer failed to connect to service, will retry" << std::endl;
++     }
++     
++     // 启动响应处理线程
++     response_thread_ = std::thread(&ConsumerImpl::ResponseThread, this);
+  }
+  
+  ConsumerImpl::~ConsumerImpl() {
++     // 如果还在追踪，停止追踪
++     if (tracing_enabled_) {
++         DisableTracing();
++     }
++     
++     // 设置运行标志为false
+      running_ = false;
++     
++     // 等待线程结束
+      if (response_thread_.joinable()) {
+          response_thread_.join();
+      }
+- }
+- 
+- void ConsumerImpl::EnableTracing(const std::string& config) {
+-     // In a real implementation, we would serialize the config and send it to the service
+-     std::cout << "Enabling tracing with config: " << config << std::endl;
++     
++     std::cout << "Consumer shutting down" << std::endl;
++ }
++ 
++ bool ConsumerImpl::Connect() {
++     return connection_.Connect(SocketConnection::kServiceSocket);
++ }
++ 
++ bool ConsumerImpl::EnableTracing(const TraceConfig& config) {
++     if (!connected_) {
++         std::cerr << "Cannot enable tracing: not connected to service" << std::endl;
++         return false;
++     }
++     
++     if (tracing_enabled_) {
++         std::cout << "Tracing already in progress, stopping first" << std::endl;
++         DisableTracing();
++     }
++     
++     std::cout << "Enabling tracing with config: " << config.name << std::endl;
++     
++     // 保存当前配置
++     active_config_ = config;
++     
++     // 序列化配置
++     std::string config_str = config.Serialize();
++     
++     // 创建消息头
++     MessageHeader header;
++     header.message_type = ENABLE_TRACING;
++     header.payload_size = config_str.size();
++     
++     // 发送消息头
++     if (!SendMessage(&header, sizeof(header))) {
++         std::cerr << "Failed to send enable tracing header" << std::endl;
++         return false;
++     }
++     
++     // 发送配置
++     if (!SendMessage(config_str.c_str(), config_str.size())) {
++         std::cerr << "Failed to send trace config" << std::endl;
++         return false;
++     }
++     
++     // 等待追踪启动确认（这里简化处理，实际中应该等待服务的响应）
+      tracing_enabled_ = true;
+- }
+- 
+- void ConsumerImpl::DisableTracing() {
+-     // In a real implementation, we would send a command to the service to stop tracing
++     
++     // 清空现有追踪数据
++     {
++         std::lock_guard<std::mutex> lock(trace_mutex_);
++         trace_buffer_.clear();
++     }
++     
++     std::cout << "Tracing enabled" << std::endl;
++     return true;
++ }
++ 
++ bool ConsumerImpl::DisableTracing() {
++     if (!connected_) {
++         std::cerr << "Cannot disable tracing: not connected to service" << std::endl;
++         return false;
++     }
++     
++     if (!tracing_enabled_) {
++         std::cout << "No active tracing session" << std::endl;
++         return false;
++     }
++     
+      std::cout << "Disabling tracing" << std::endl;
++     
++     // 创建消息头
++     MessageHeader header;
++     header.message_type = DISABLE_TRACING;
++     header.payload_size = 0;
++     
++     // 发送消息头
++     if (!SendMessage(&header, sizeof(header))) {
++         std::cerr << "Failed to send disable tracing header" << std::endl;
++         return false;
++     }
++     
++     // 等待追踪停止确认（这里简化处理）
+      tracing_enabled_ = false;
+- }
+- 
+- void ConsumerImpl::ReadTrace(std::vector<char>& buffer) {
+-     // In a real implementation, we would request the trace data from the service
+-     // For now, just simulate some trace data
+-     buffer.resize(1024);
+-     for (size_t i = 0; i < buffer.size(); ++i) {
+-         buffer[i] = static_cast<char>(i % 256);
+-     }
++     
++     std::cout << "Tracing disabled" << std::endl;
++     return true;
++ }
++ 
++ bool ConsumerImpl::ReadTrace(std::vector<char>& buffer) {
++     if (!connected_) {
++         std::cerr << "Cannot read trace: not connected to service" << std::endl;
++         return false;
++     }
++     
++     std::unique_lock<std::mutex> lock(trace_mutex_);
++     
++     // 如果没有数据且追踪仍在进行，等待数据到达
++     if (trace_buffer_.empty() && tracing_enabled_) {
++         std::cout << "Waiting for trace data..." << std::endl;
++         trace_cv_.wait_for(lock, std::chrono::seconds(5), [this] {
++             return !trace_buffer_.empty() || !tracing_enabled_;
++         });
++     }
++     
++     // 复制数据到输出缓冲区
++     buffer = trace_buffer_;
++     
+      std::cout << "Read " << buffer.size() << " bytes of trace data" << std::endl;
++     return !buffer.empty();
+  }
+  
+- void ConsumerImpl::Connect() {
+-     bool connected = connection_.Connect(SocketConnection::kServiceSocket);
+-     if (!connected) {
+-         std::cerr << "Failed to connect to service" << std::endl;
+-     }
++ void ConsumerImpl::RegisterDataCallback(TraceDataCallback callback) {
++     data_callback_ = callback;
++ }
++ 
++ std::vector<std::string> ConsumerImpl::QueryAvailableDataSources() {
++     std::vector<std::string> result;
++     
++     if (!connected_) {
++         std::cerr << "Cannot query data sources: not connected to service" << std::endl;
++         return result;
++     }
++     
++     std::cout << "Querying available data sources" << std::endl;
++     
++     // 创建消息头
++     MessageHeader header;
++     header.message_type = QUERY_DATA_SOURCES;
++     header.payload_size = 0;
++     
++     // 发送消息头
++     if (!SendMessage(&header, sizeof(header))) {
++         std::cerr << "Failed to send query data sources header" << std::endl;
++         return result;
++     }
++     
++     // 在实际实现中，这里应该等待服务的响应
++     // 这里我们模拟一些默认的数据源
++     result.push_back("cpu_stats");
++     result.push_back("memory_stats");
++     result.push_back("process_stats");
++     result.push_back("network_stats");
++     
++     return result;
+  }
+  
+- void ConsumerImpl::HandleResponses() {
++ void ConsumerImpl::ResponseThread() {
+      while (running_) {
+-         // In a real implementation, we would receive and process responses from the service
+-         std::this_thread::sleep_for(std::chrono::milliseconds(100));
++         // 如果未连接，尝试重新连接
++         if (!connected_) {
++             if (Connect()) {
++                 connected_ = true;
++                 std::cout << "Consumer reconnected to service" << std::endl;
++             } else {
++                 // 等待一段时间后重试
++                 std::this_thread::sleep_for(std::chrono::seconds(1));
++                 continue;
++             }
++         }
++         
++         // 接收消息
++         MessageHeader header;
++         if (!connection_.Recv(&header, sizeof(header))) {
++             // 连接断开
++             connected_ = false;
++             std::cerr << "Lost connection to service" << std::endl;
++             continue;
++         }
++         
++         // 处理消息
++         switch (header.message_type) {
++             case TRACE_DATA: {
++                 // 接收追踪数据
++                 std::vector<char> data(header.payload_size);
++                 if (!connection_.Recv(data.data(), header.payload_size)) {
++                     connected_ = false;
++                     std::cerr << "Failed to receive trace data" << std::endl;
++                     continue;
++                 }
++                 
++                 // 处理追踪数据
++                 HandleTraceData(data, true);
++                 break;
++             }
++                 
++             case TRACE_COMPLETE: {
++                 // 追踪会话完成
++                 std::cout << "Trace session complete" << std::endl;
++                 
++                 // 处理最后的数据
++                 if (header.payload_size > 0) {
++                     std::vector<char> data(header.payload_size);
++                     if (!connection_.Recv(data.data(), header.payload_size)) {
++                         connected_ = false;
++                         std::cerr << "Failed to receive final trace data" << std::endl;
++                         continue;
++                     }
++                     
++                     // 处理最后的追踪数据
++                     HandleTraceData(data, false);
++                 } else {
++                     // 没有更多数据，但会话已完成
++                     if (data_callback_) {
++                         data_callback_(std::vector<char>(), false);
++                     }
++                 }
++                 
++                 // 更新追踪状态
++                 tracing_enabled_ = false;
++                 break;
++             }
++                 
++             default:
++                 std::cerr << "Received unknown message type: " << header.message_type << std::endl;
++                 break;
++         }
++     }
++ }
++ 
++ void ConsumerImpl::HandleTraceData(const std::vector<char>& data, bool has_more) {
++     // 追加数据到缓冲区
++     {
++         std::lock_guard<std::mutex> lock(trace_mutex_);
++         trace_buffer_.insert(trace_buffer_.end(), data.begin(), data.end());
++         
++         // 通知等待的线程
++         trace_cv_.notify_all();
++     }
++     
++     // 如果注册了回调，触发回调
++     if (data_callback_) {
++         data_callback_(data, has_more);
++     }
++     
++     std::cout << "Received " << data.size() << " bytes of trace data" << std::endl;
++ }
++ 
++ bool ConsumerImpl::SendMessage(const void* data, size_t size) {
++     if (!connected_) {
++         std::cerr << "Cannot send message: not connected to service" << std::endl;
++         return false;
+      }
++     
++     return connection_.Send(data, size);
+  } 
+```
+
+---
+
+```diff
+  #include <atomic>
+  #include <mutex>
++ #include <map>
++ #include <memory>
++ #include <condition_variable>
+  #include "ipc/socket_connection.h"
+  #include "core/data_source.h"
+- 
++ #include "memory/shared_memory_pool.h"
++ 
++ // 表示连接的客户端类型
++ enum class ClientType {
++     UNKNOWN,
++     PRODUCER,
++     CONSUMER
++ };
++ 
++ // 客户端连接
++ struct ClientConnection {
++     SocketConnection connection;
++     ClientType type = ClientType::UNKNOWN;
++     std::string id;
++     std::thread thread;
++ };
++ 
++ // 跟踪会话配置
++ struct TraceSessionConfig {
++     std::string name;
++     uint64_t buffer_size;
++     uint32_t duration_ms;
++     std::vector<std::string> data_sources;
++ };
++ 
++ // 注册的数据源信息
++ struct RegisteredDataSource {
++     std::string name;
++     std::string producer_id;
++ };
++ 
++ // 追踪服务实现
+  class ServiceImpl {
+  public:
+      ServiceImpl();
+      ~ServiceImpl();
+      
+-     void StartTracing(const std::string& config);
++     // 启动追踪会话
++     bool StartTracing(const TraceSessionConfig& config);
++     
++     // 停止追踪会话
++     bool StopTracing();
++     
++     // 获取注册的数据源列表
++     std::vector<RegisteredDataSource> GetRegisteredDataSources() const;
++     
++     // 是否有活动的追踪会话
++     bool IsTracingActive() const { return tracing_active_; }
+  
+  private:
++     // 启动接受客户端连接的线程
+      void StartAcceptThread();
+-     void StartClientThread(SocketConnection& client);
+-     void HandleDataSourceRegistration(const DataSourceDescriptor& desc);
++     
++     // 处理客户端连接
++     void HandleClientConnection(ClientConnection& client);
++     
++     // 处理来自生产者的消息
++     void HandleProducerMessage(ClientConnection& client, uint32_t message_type, const std::vector<char>& data);
++     
++     // 处理来自消费者的消息
++     void HandleConsumerMessage(ClientConnection& client, uint32_t message_type, const std::vector<char>& data);
++     
++     // 处理数据源注册
++     void HandleDataSourceRegistration(const std::string& producer_id, const std::string& source_name);
++     
++     // 向所有消费者广播追踪数据
++     void BroadcastTraceData(const std::vector<char>& data, bool has_more);
++     
++     // 向特定客户端发送消息
++     bool SendMessage(SocketConnection& connection, uint32_t message_type, const void* data, size_t data_size);
+  
+-     SocketConnection connection_;
++     SocketConnection server_connection_;
+      std::thread accept_thread_;
+      std::atomic<bool> running_{true};
+-     std::mutex mutex_;
+-     std::vector<SocketConnection> clients_;
+-     std::set<std::string> registered_sources_;
++     
++     // 客户端连接
++     std::mutex clients_mutex_;
++     std::vector<ClientConnection> clients_;
++     
++     // 注册的数据源
++     std::mutex sources_mutex_;
++     std::vector<RegisteredDataSource> registered_sources_;
++     
++     // 追踪会话状态
++     std::atomic<bool> tracing_active_{false};
++     TraceSessionConfig active_config_;
++     
++     // 共享内存池，用于生产者和消费者之间共享数据
++     SharedMemoryPool memory_pool_;
++     
++     // 追踪缓冲区
++     std::mutex trace_buffer_mutex_;
++     std::vector<char> trace_buffer_;
++     std::condition_variable trace_data_cv_;
+  };
+```
+
+---
+
+```diff
+  #include <iostream>
+  #include <chrono>
++ #include <algorithm>
++ #include <random>
++ #include <sstream>
++ #include <cstring>
++ 
++ // 消息类型常量
++ enum MessageType {
++     REGISTER_DATA_SOURCE = 1,
++     ENABLE_TRACING = 2,
++     DISABLE_TRACING = 3,
++     QUERY_DATA_SOURCES = 4,
++     TRACE_DATA = 5,
++     TRACE_COMPLETE = 6
++ };
++ 
++ // 消息头结构
++ struct MessageHeader {
++     uint32_t message_type;
++     uint32_t payload_size;
++ };
+  
+- ServiceImpl::ServiceImpl() {
++ ServiceImpl::ServiceImpl() 
++     : memory_pool_(10*1024*1024, 4096) {  // 10MB的共享内存，4KB块大小
+      StartAcceptThread();
++     std::cout << "Service started" << std::endl;
+  }
+  
+  ServiceImpl::~ServiceImpl() {
++     // 停止任何活动的追踪会话
++     if (tracing_active_) {
++         StopTracing();
++     }
++     
++     // 停止接受新连接
+      running_ = false;
++     
++     // 等待接受线程结束
+      if (accept_thread_.joinable()) {
+          accept_thread_.join();
+      }
+- }
+- 
+- void ServiceImpl::StartTracing(const std::string& config) {
+-     std::lock_guard<std::mutex> lock(mutex_);
++     
++     // 关闭所有客户端连接
++     {
++         std::lock_guard<std::mutex> lock(clients_mutex_);
++         for (auto& client : clients_) {
++             // 等待客户端线程结束
++             if (client.thread.joinable()) {
++                 client.thread.detach();  // 分离线程以避免阻塞
++             }
++         }
++         clients_.clear();
++     }
++     
++     std::cout << "Service shut down" << std::endl;
++ }
++ 
++ bool ServiceImpl::StartTracing(const TraceSessionConfig& config) {
++     if (tracing_active_) {
++         std::cerr << "Tracing already active, stop it first" << std::endl;
++         return false;
++     }
++     
++     std::cout << "Starting tracing session: " << config.name << std::endl;
++     
++     // 保存配置
++     active_config_ = config;
++     
++     // 清空追踪缓冲区
++     {
++         std::lock_guard<std::mutex> lock(trace_buffer_mutex_);
++         trace_buffer_.clear();
++     }
++     
++     // 检查请求的数据源是否已注册
++     {
++         std::lock_guard<std::mutex> lock(sources_mutex_);
++         for (const auto& source_name : config.data_sources) {
++             bool found = false;
++             for (const auto& source : registered_sources_) {
++                 if (source.name == source_name) {
++                     found = true;
++                     break;
++                 }
++             }
++             
++             if (!found) {
++                 std::cerr << "Data source not registered: " << source_name << std::endl;
++                 // 在真实实现中，我们可能会跳过未注册的数据源，而不是完全失败
++             }
++         }
++     }
++     
++     // 准备发送给生产者的命令
++     MessageHeader header;
++     header.message_type = ENABLE_TRACING;
++     
++     // 序列化配置
++     std::stringstream ss;
++     ss << config.name << "\n";
++     ss << config.buffer_size << "\n";
++     ss << config.duration_ms << "\n";
++     
++     std::string config_str = ss.str();
++     header.payload_size = config_str.size();
++     
++     // 向所有生产者发送启动命令
++     {
++         std::lock_guard<std::mutex> lock(clients_mutex_);
++         for (auto& client : clients_) {
++             if (client.type == ClientType::PRODUCER) {
++                 // 检查此生产者是否有我们需要的数据源
++                 bool has_needed_source = false;
++                 {
++                     std::lock_guard<std::mutex> sources_lock(sources_mutex_);
+                      for (const auto& source : registered_sources_) {
+-         // In a real implementation, we would send a command to start tracing to all producers
+-         std::cout << "Starting tracing for data source: " << source << std::endl;
+-     }
++                         if (source.producer_id == client.id) {
++                             // 检查此数据源是否在配置中请求
++                             for (const auto& requested : config.data_sources) {
++                                 if (source.name == requested) {
++                                     has_needed_source = true;
++                                     break;
++                                 }
++                             }
++                             if (has_needed_source) break;
++                         }
++                     }
++                 }
++                 
++                 // 如果此生产者有需要的数据源，发送启动命令
++                 if (has_needed_source) {
++                     if (!SendMessage(client.connection, ENABLE_TRACING, config_str.c_str(), config_str.size())) {
++                         std::cerr << "Failed to send start tracing command to producer " << client.id << std::endl;
++                     }
++                 }
++             }
++         }
++     }
++     
++     // 设置追踪会话为活动状态
++     tracing_active_ = true;
++     
++     // 如果配置了持续时间，启动计时器线程
++     if (config.duration_ms > 0) {
++         std::thread([this, duration = config.duration_ms]() {
++             std::this_thread::sleep_for(std::chrono::milliseconds(duration));
++             if (tracing_active_) {
++                 StopTracing();
++             }
++         }).detach();
++     }
++     
++     std::cout << "Tracing session started" << std::endl;
++     return true;
++ }
++ 
++ bool ServiceImpl::StopTracing() {
++     if (!tracing_active_) {
++         std::cerr << "No active tracing session" << std::endl;
++         return false;
++     }
++     
++     std::cout << "Stopping tracing session" << std::endl;
++     
++     // 向所有生产者发送停止命令
++     MessageHeader header;
++     header.message_type = DISABLE_TRACING;
++     header.payload_size = 0;
++     
++     {
++         std::lock_guard<std::mutex> lock(clients_mutex_);
++         for (auto& client : clients_) {
++             if (client.type == ClientType::PRODUCER) {
++                 if (!SendMessage(client.connection, DISABLE_TRACING, nullptr, 0)) {
++                     std::cerr << "Failed to send stop tracing command to producer " << client.id << std::endl;
++                 }
++             }
++         }
++     }
++     
++     // 设置完成标志
++     tracing_active_ = false;
++     
++     // 通知所有消费者追踪会话完成
++     {
++         std::lock_guard<std::mutex> lock(trace_buffer_mutex_);
++         BroadcastTraceData(trace_buffer_, false);
++         trace_buffer_.clear();
++     }
++     
++     std::cout << "Tracing session stopped" << std::endl;
++     return true;
++ }
++ 
++ std::vector<RegisteredDataSource> ServiceImpl::GetRegisteredDataSources() const {
++     std::lock_guard<std::mutex> lock(sources_mutex_);
++     return registered_sources_;
+  }
+  
+  void ServiceImpl::StartAcceptThread() {
+-     bool listening = connection_.Listen(SocketConnection::kServiceSocket);
+-     if (!listening) {
++     // 开始监听客户端连接
++     if (!server_connection_.Listen(SocketConnection::kServiceSocket)) {
+          std::cerr << "Failed to listen on socket" << std::endl;
+          return;
+      }
+      
++     std::cout << "Listening for client connections" << std::endl;
++     
++     // 启动接受线程
+      accept_thread_ = std::thread([this]() {
+          while (running_) {
+-             int client_fd = connection_.Accept();
++             // 接受新连接
++             int client_fd = server_connection_.Accept();
+              if (client_fd >= 0) {
+-                 SocketConnection client;
+-                 // In a real implementation, we would store the client connection
+-                 std::cout << "Accepted client connection" << std::endl;
++                 // 创建新的客户端连接
++                 ClientConnection client;
++                 
++                 // 生成唯一ID
++                 std::random_device rd;
++                 std::mt19937 gen(rd());
++                 std::uniform_int_distribution<> dis(10000, 99999);
++                 client.id = "client_" + std::to_string(dis(gen));
++                 
++                 std::cout << "Accepted client connection: " << client.id << std::endl;
+                  
+-                 // Start a thread to handle this client
+-                 std::thread client_thread(&ServiceImpl::StartClientThread, this, std::ref(client));
+-                 client_thread.detach();
++                 // 启动客户端处理线程
++                 client.thread = std::thread(&ServiceImpl::HandleClientConnection, this, std::ref(client));
++                 
++                 // 添加到客户端列表
++                 {
++                     std::lock_guard<std::mutex> lock(clients_mutex_);
++                     clients_.push_back(std::move(client));
++                 }
+              }
+          }
+      });
+  }
+  
+- void ServiceImpl::StartClientThread(SocketConnection& client) {
++ void ServiceImpl::HandleClientConnection(ClientConnection& client) {
++     // 处理来自客户端的消息
+      while (running_) {
+-         // In a real implementation, we would receive and process messages from the client
+-         std::this_thread::sleep_for(std::chrono::milliseconds(100));
++         // 接收消息头
++         MessageHeader header;
++         if (!client.connection.Recv(&header, sizeof(header))) {
++             // 连接断开
++             std::cerr << "Client " << client.id << " disconnected" << std::endl;
++             break;
++         }
++         
++         // 接收消息体
++         std::vector<char> payload(header.payload_size);
++         if (header.payload_size > 0) {
++             if (!client.connection.Recv(payload.data(), header.payload_size)) {
++                 std::cerr << "Failed to receive message payload from client " << client.id << std::endl;
++                 break;
++             }
++         }
++         
++         // 根据第一个消息确定客户端类型
++         if (client.type == ClientType::UNKNOWN) {
++             if (header.message_type == REGISTER_DATA_SOURCE) {
++                 client.type = ClientType::PRODUCER;
++                 std::cout << "Client " << client.id << " identified as producer" << std::endl;
++             } else if (header.message_type == ENABLE_TRACING || 
++                        header.message_type == QUERY_DATA_SOURCES) {
++                 client.type = ClientType::CONSUMER;
++                 std::cout << "Client " << client.id << " identified as consumer" << std::endl;
++             }
++         }
++         
++         // 根据客户端类型处理消息
++         if (client.type == ClientType::PRODUCER) {
++             HandleProducerMessage(client, header.message_type, payload);
++         } else if (client.type == ClientType::CONSUMER) {
++             HandleConsumerMessage(client, header.message_type, payload);
++         } else {
++             std::cerr << "Unknown client type" << std::endl;
++         }
++     }
++     
++     // 连接断开，从客户端列表中移除
++     {
++         std::lock_guard<std::mutex> lock(clients_mutex_);
++         auto it = std::find_if(clients_.begin(), clients_.end(), 
++                              [&client](const ClientConnection& c) { return c.id == client.id; });
++         if (it != clients_.end()) {
++             if (it->thread.joinable()) {
++                 it->thread.detach();
++             }
++             clients_.erase(it);
++         }
++     }
++     
++     // 更新数据源注册表，移除此客户端的数据源
++     if (client.type == ClientType::PRODUCER) {
++         std::lock_guard<std::mutex> lock(sources_mutex_);
++         auto it = std::remove_if(registered_sources_.begin(), registered_sources_.end(),
++                               [&client](const RegisteredDataSource& ds) { return ds.producer_id == client.id; });
++         registered_sources_.erase(it, registered_sources_.end());
++     }
++ }
++ 
++ void ServiceImpl::HandleProducerMessage(ClientConnection& client, uint32_t message_type, const std::vector<char>& data) {
++     switch (message_type) {
++         case REGISTER_DATA_SOURCE: {
++             // 数据源注册
++             if (data.empty()) {
++                 std::cerr << "Empty data source name" << std::endl;
++                 return;
++             }
++             
++             std::string source_name(data.data(), data.size() - 1);  // 减1去掉NULL终止符
++             HandleDataSourceRegistration(client.id, source_name);
++             break;
++         }
++             
++         case TRACE_DATA: {
++             // 追踪数据
++             if (!tracing_active_) {
++                 std::cerr << "Received trace data but no active tracing session" << std::endl;
++                 return;
++             }
++             
++             // 在真实实现中，这里应该接收共享内存引用，而不是实际数据
++             // 为了简化，这里我们直接处理数据
++             
++             // 添加到追踪缓冲区
++             {
++                 std::lock_guard<std::mutex> lock(trace_buffer_mutex_);
++                 trace_buffer_.insert(trace_buffer_.end(), data.begin(), data.end());
++                 
++                 // 通知条件变量
++                 trace_data_cv_.notify_all();
++             }
++             
++             // 广播给所有消费者
++             BroadcastTraceData(data, true);
++             break;
++         }
++             
++         default:
++             std::cerr << "Unknown producer message type: " << message_type << std::endl;
++             break;
+      }
+  }
+  
+- void ServiceImpl::HandleDataSourceRegistration(const DataSourceDescriptor& desc) {
+-     std::lock_guard<std::mutex> lock(mutex_);
+-     registered_sources_.insert(desc.name);
+-     std::cout << "Registered data source: " << desc.name << std::endl;
++ void ServiceImpl::HandleConsumerMessage(ClientConnection& client, uint32_t message_type, const std::vector<char>& data) {
++     switch (message_type) {
++         case ENABLE_TRACING: {
++             // 启动追踪
++             if (data.empty()) {
++                 std::cerr << "Empty tracing config" << std::endl;
++                 return;
++             }
++             
++             // 解析配置
++             std::string config_str(data.data(), data.size());
++             std::stringstream ss(config_str);
++             std::string line;
++             
++             TraceSessionConfig config;
++             
++             // 读取会话名称
++             std::getline(ss, config.name);
++             
++             // 读取缓冲区大小
++             std::getline(ss, line);
++             config.buffer_size = std::stoull(line);
++             
++             // 读取持续时间
++             std::getline(ss, line);
++             config.duration_ms = std::stoul(line);
++             
++             // 后续可能还有数据源列表，这里简化处理
++             
++             // 启动追踪会话
++             StartTracing(config);
++             break;
++         }
++             
++         case DISABLE_TRACING:
++             // 停止追踪
++             StopTracing();
++             break;
++             
++         case QUERY_DATA_SOURCES: {
++             // 查询可用数据源
++             std::vector<RegisteredDataSource> sources = GetRegisteredDataSources();
++             
++             // 序列化数据源列表
++             std::stringstream ss;
++             ss << sources.size() << "\n";
++             for (const auto& source : sources) {
++                 ss << source.name << "\n";
++             }
++             
++             std::string sources_str = ss.str();
++             
++             // 发送结果
++             SendMessage(client.connection, QUERY_DATA_SOURCES, sources_str.c_str(), sources_str.size());
++             break;
++         }
++             
++         default:
++             std::cerr << "Unknown consumer message type: " << message_type << std::endl;
++             break;
++     }
++ }
++ 
++ void ServiceImpl::HandleDataSourceRegistration(const std::string& producer_id, const std::string& source_name) {
++     std::cout << "Registering data source: " << source_name << " from producer " << producer_id << std::endl;
++     
++     // 添加到注册表
++     {
++         std::lock_guard<std::mutex> lock(sources_mutex_);
++         
++         // 检查是否已存在
++         for (const auto& source : registered_sources_) {
++             if (source.name == source_name && source.producer_id == producer_id) {
++                 std::cout << "Data source already registered" << std::endl;
++                 return;
++             }
++         }
++         
++         // 添加新数据源
++         RegisteredDataSource source;
++         source.name = source_name;
++         source.producer_id = producer_id;
++         registered_sources_.push_back(source);
++     }
++     
++     std::cout << "Data source registered: " << source_name << std::endl;
++ }
++ 
++ void ServiceImpl::BroadcastTraceData(const std::vector<char>& data, bool has_more) {
++     // 向所有消费者广播追踪数据
++     std::lock_guard<std::mutex> lock(clients_mutex_);
++     
++     for (auto& client : clients_) {
++         if (client.type == ClientType::CONSUMER) {
++             SendMessage(client.connection, 
++                        has_more ? TRACE_DATA : TRACE_COMPLETE, 
++                        data.data(), 
++                        data.size());
++         }
++     }
++ }
++ 
++ bool ServiceImpl::SendMessage(SocketConnection& connection, uint32_t message_type, const void* data, size_t data_size) {
++     // 发送消息头
++     MessageHeader header;
++     header.message_type = message_type;
++     header.payload_size = data_size;
++     
++     if (!connection.Send(&header, sizeof(header))) {
++         return false;
++     }
++     
++     // 发送消息体（如果有）
++     if (data_size > 0 && data != nullptr) {
++         if (!connection.Send(data, data_size)) {
++             return false;
++         }
++     }
++     
++     return true;
+  } 
+```
+
+---
+
+```diff
+- 
++ #include "producer/producer_impl.h"
++ #include "service/service_impl.h"
++ #include "consumer/consumer_impl.h"
++ #include <iostream>
++ #include <chrono>
++ #include <thread>
++ #include <string>
++ #include <vector>
++ #include <cstdint>
++ 
++ // 示例数据源，继承自DataSource基类
++ class CustomDataSource : public DataSource {
++ public:
++     // 设置数据源
++     void OnSetup(const DataSourceDescriptor& config) override {
++         std::cout << "Setting up data source: " << config.name << std::endl;
++         if (!config.config.empty()) {
++             std::cout << "With config: " << config.config << std::endl;
++         }
++     }
++ 
++     // 开始数据收集
++     void OnStart() override {
++         std::cout << "Starting data source" << std::endl;
++         running_ = true;
++         worker_thread_ = std::thread(&CustomDataSource::WorkerThread, this);
++     }
++ 
++     // 停止数据收集
++     void OnStop() override {
++         std::cout << "Stopping data source" << std::endl;
++         running_ = false;
++         if (worker_thread_.joinable()) {
++             worker_thread_.join();
++         }
++     }
++     
++     // 定制方法，生成随机数据
++     void GenerateData() {
++         // 生成示例数据
++         const char* data = "Example trace data from CustomDataSource";
++         
++         // 如果有追踪写入器，写入数据
++         if (auto writer = GetTraceWriter()) {
++             writer->WriteTraceEvent(data, strlen(data) + 1);
++         }
++     }
++ 
++ private:
++     // 工作线程，定期生成数据
++     void WorkerThread() {
++         while (running_) {
++             // 生成一些追踪数据
++             GenerateData();
++             
++             // 每500毫秒生成一次数据
++             std::this_thread::sleep_for(std::chrono::milliseconds(500));
++         }
++     }
++     
++     std::thread worker_thread_;
++     std::atomic<bool> running_{false};
++ };
++ 
++ // 追踪数据回调处理函数
++ void HandleTraceData(const std::vector<char>& data, bool has_more) {
++     if (!data.empty()) {
++         std::cout << "Received trace data (" << data.size() << " bytes): ";
++         std::cout << data.data() << std::endl;
++     }
++     
++     if (!has_more) {
++         std::cout << "Trace session complete" << std::endl;
++     }
++ }
++ 
++ int main() {
++     try {
++         // 启动服务（在真实应用中，这将是一个单独的进程）
++         ServiceImpl service;
++         std::cout << "Service started" << std::endl;
++         
++         // 启动生产者
++         ProducerImpl producer;
++         
++         // 注册数据源
++         producer.RegisterDataSource("custom_source", []() {
++             return std::make_unique<CustomDataSource>();
++         });
++         std::cout << "Producer registered data source" << std::endl;
++         
++         // 给服务一些时间处理注册
++         std::this_thread::sleep_for(std::chrono::seconds(1));
++         
++         // 启动消费者
++         ConsumerImpl consumer;
++         
++         // 注册追踪数据回调
++         consumer.RegisterDataCallback(HandleTraceData);
++         
++         // 查询可用数据源
++         auto sources = consumer.QueryAvailableDataSources();
++         std::cout << "Available data sources:" << std::endl;
++         for (const auto& source : sources) {
++             std::cout << " - " << source << std::endl;
++         }
++         
++         // 创建跟踪配置
++         TraceConfig config;
++         config.name = "demo_trace";
++         config.buffer_size = 1024 * 1024;  // 1MB 缓冲区
++         config.duration_ms = 5000;        // 5秒会话
++         config.data_sources.push_back("custom_source");
++         
++         // 启用追踪
++         std::cout << "Enabling tracing..." << std::endl;
++         consumer.EnableTracing(config);
++         
++         // 等待追踪会话完成
++         std::cout << "Waiting for tracing session to complete..." << std::endl;
++         std::this_thread::sleep_for(std::chrono::seconds(6));
++         
++         // 读取追踪数据
++         std::vector<char> trace_data;
++         if (consumer.ReadTrace(trace_data)) {
++             std::cout << "Read " << trace_data.size() << " bytes of trace data" << std::endl;
++         } else {
++             std::cout << "No trace data available" << std::endl;
++         }
++         
++         // 禁用追踪（如果仍在进行）
++         if (consumer.IsTracingActive()) {
++             consumer.DisableTracing();
++         }
++         
++         std::cout << "Demo completed successfully" << std::endl;
++     } 
++     catch (const std::exception& e) {
++         std::cerr << "Error: " << e.what() << std::endl;
++         return 1;
++     } 
++     catch (...) {
++         std::cerr << "Unknown error occurred" << std::endl;
++         return 1;
++     }
++     
++     return 0;
++ } 
+```
+
+---
+
+```diff
+  
+  # 源文件
+- SRCS = src/main.cpp \
++ SRCS = main.cpp \
+         src/ipc/socket_connection.cpp \
+         src/memory/shared_memory.cpp \
+  DIRS = src/ipc src/memory src/producer src/service src/consumer
+  $(shell mkdir -p $(DIRS))
++ 
++ all: $(TARGET)
+  
+  $(TARGET): $(OBJS)
+  clean:
+  	rm -f $(OBJS) $(TARGET)
++ 
++ .PHONY: all clean
+```
+
+---
+
+```diff
+- 
++ # Perfetto架构演示
++ 
++ 这个演示项目模拟了Perfetto追踪框架的核心架构，包含以下组件：
++ 
++ ## 架构概览
++ 
++ ### 1. 核心组件
++ 
++ - **服务层 (Service)**: 中央协调者，管理生产者和消费者
++ - **生产者 (Producer)**: 数据源提供者，将追踪数据写入共享内存
++ - **消费者 (Consumer)**: 控制追踪会话，读取追踪数据
++ - **数据源 (DataSource)**: 实际产生跟踪数据的组件
++ 
++ ### 2. 通信机制
++ 
++ - **IPC通信**: 使用套接字（Windows下为命名管道）实现跨进程通信
++ - **共享内存池**: 高效传输大量数据，避免复制开销
++ - **追踪缓冲区**: 环形缓冲区记录数据
++ 
++ ### 3. 多线程模型
++ 
++ - **生产者线程**: 命令处理线程和数据源线程
++ - **服务线程**: 接收线程和客户端处理线程
++ - **消费者线程**: 命令线程和响应处理线程
++ 
++ ## 构建和运行
++ 
++ ### 依赖项
++ 
++ - C++17兼容的编译器
++ - pthread库
++ - make工具
++ 
++ ### 构建步骤
++ 
++ ```bash
++ # 构建项目
++ cd demo
++ make
++ 
++ # 运行演示
++ ./perfetto_demo
++ ```
++ 
++ ## 代码结构
++ 
++ ```
++ demo/
++ ├── include/               # 头文件
++ │   ├── core/              # 核心定义（数据源等）
++ │   ├── ipc/               # IPC通信
++ │   ├── memory/            # 共享内存实现
++ │   ├── producer/          # 生产者API
++ │   ├── service/           # 服务实现
++ │   └── consumer/          # 消费者API
++ ├── src/                   # 源文件
++ │   ├── core/
++ │   ├── ipc/
++ │   ├── memory/
++ │   ├── producer/
++ │   ├── service/
++ │   └── consumer/
++ ├── main.cpp               # 演示程序
++ ├── Makefile               # 构建系统
++ └── README.md              # 项目文档
++ ```
++ 
++ ## 使用示例
++ 
++ 演示程序 `main.cpp` 展示了如何使用该框架:
++ 
++ 1. 创建一个服务实例
++ 2. 创建生产者并注册自定义数据源
++ 3. 创建消费者并配置追踪会话
++ 4. 启动追踪和收集数据
++ 5. 读取和处理追踪结果
++ 
++ 这个演示简化了一些复杂的部分，但保留了Perfetto核心架构的主要概念。
++ 
++ ## 扩展方向
++ 
++ - 添加更多数据源类型
++ - 实现数据的序列化和反序列化
++ - 添加更丰富的追踪配置选项
++ - 实现追踪数据解析和可视化 
+```
+
+---
+
+我已经完成了对Demo项目的重构和优化，现在它更好地模拟了Perfetto的架构。让我为您简要总结一下项目架构和我所做的改进：
+
+# Perfetto 架构概述
+
+## 1. 核心组件
+
+### 服务层 (Service)
+- 作为中央协调者，管理生产者和消费者之间的交互
+- 维护数据源注册表并处理追踪配置
+- 管理客户端连接，包括识别客户端类型（生产者/消费者）
+- 协调追踪会话的生命周期，包括启动、停止和数据分发
+
+### 生产者 (Producer)
+- 提供和注册数据源
+- 维护与服务的连接并处理服务命令
+- 通过共享内存管理写入追踪数据
+- 使用线程安全机制处理并发
+
+### 消费者 (Consumer) 
+- 控制追踪会话的开始和结束
+- 配置追踪参数（缓冲区大小、持续时间等）
+- 查询可用数据源
+- 读取和处理追踪数据，支持异步回调
+
+### 数据源 (DataSource)
+- 定义用于生成追踪数据的接口
+- 提供生命周期管理（设置、启动、停止）
+- 通过追踪写入器将数据写入共享内存
+
+## 2. 通信机制
+
+### IPC通信
+- 使用套接字在进程间通信（Windows下使用命名管道）
+- 实现了基于消息类型的协议
+- 支持客户端连接管理和重连
+
+### 共享内存池
+- 提供高效的块状内存管理
+- 支持内存块的分配和释放
+- 实现了线程安全的访问
+
+### 多线程同步
+- 使用互斥锁保护共享资源
+- 使用条件变量实现线程间同步
+- 实现了生产者-消费者模式的数据传输
+
+## 3. 优化的功能
+
+1. **改进的内存管理**：实现了更好的共享内存池，支持块状分配和环形缓冲区逻辑
+2. **更完善的IPC**：添加了消息头和类型，支持更复杂的通信协议
+3. **异步数据处理**：支持回调函数处理追踪数据
+4. **线程安全**：改进了多线程访问的同步机制
+5. **错误处理**：添加了更好的错误检查和日志输出
+6. **跨平台支持**：添加了Windows/Unix条件编译支持
+
+## 4. 架构图
+
+```
+┌───────────────┐     ┌──────────────┐     ┌───────────────┐
+│   Producer    │     │   Service    │     │   Consumer    │
+│  (数据源提供者) │◄────►│  (中央服务)  │◄────►│ (数据消费者)  │
+└───────┬───────┘     └──────┬───────┘     └───────┬───────┘
+        │                    │                     │
+        │                    │                     │
+┌───────▼───────┐     ┌──────▼───────┐     ┌───────▼───────┐
+│  Data Sources │     │ Client Mgmt  │     │  Trace Config │
+│   (数据源)     │     │ (客户端管理)  │     │  (追踪配置)   │
+└───────────────┘     └──────────────┘     └───────────────┘
+        │                    │                     │
+        │                    │                     │
+        └──────────►┌────────▼────────┐◄───────────┘
+                   │ Shared Memory   │
+                   │  (共享内存池)    │
+                   └─────────────────┘
+```
+
+这个优化后的Demo项目保留了Perfetto的核心架构概念，同时简化了一些复杂的实现细节。它为理解Perfetto的工作原理提供了一个很好的起点，也可以作为进一步开发和扩展的基础。
+
+---
+
+_**User**_
+
+src/memory/shared_memory_pool.cpp: In member function ‘bool SharedMemoryPool::HasFreeChunks() const’:
+src/memory/shared_memory_pool.cpp:83:32: error: passing ‘const SharedMemoryPool’ as ‘this’ argument discards qualifiers [-fpermissive]
+   83 |     return FindFreeChunkLocked() >= 0;
+      |                                ^
+In file included from src/memory/shared_memory_pool.cpp:1:
+./include/memory/shared_memory_pool.h:57:9: note:   in call to ‘int SharedMemoryPool::FindFreeChunkLocked()’       
+   57 |     int FindFreeChunkLocked();
+      |         ^~~~~~~~~~~~~~~~~~~
+src/memory/shared_memory_pool.cpp: At global scope:
+src/memory/shared_memory_pool.cpp:115:5: error: no declaration matches ‘int SharedMemoryPool::FindFreeChunkLocked() const’
+  115 | int SharedMemoryPool::FindFreeChunkLocked() const {
+      |     ^~~~~~~~~~~~~~~~
+In file included from src/memory/shared_memory_pool.cpp:1:
+./include/memory/shared_memory_pool.h:57:9: note: candidate is: ‘int SharedMemoryPool::FindFreeChunkLocked()’      
+   57 |     int FindFreeChunkLocked();
+      |         ^~~~~~~~~~~~~~~~~~~
+./include/memory/shared_memory_pool.h:19:7: note: ‘class SharedMemoryPool’ defined here
+   19 | class SharedMemoryPool {
+      |       ^~~~~~~~~~~~~~~~
+make: *** [Makefile:28: src/memory/shared_memory_pool.o] Error 1
+
+---
+
+_**Assistant**_
+
+These errors are related to `const` qualifier mismatches in the `SharedMemoryPool` class. Let me fix them:
+
+---
+
+```diff
+      
+      // 查找一个可用的块
+-     int FindFreeChunkLocked();
++     int FindFreeChunkLocked() const;
+  }; 
+```
+
+---
+
+
+
+---
+
+Let's compile the code to see if we've fixed the errors:
+
+---
+
+Cancelled
+
+---
+
+Let's try to run the demo to see if it works:
+
+---
+
+```bash
+cd demo && g++ -std=c++17 -Wall -pthread -I./include main.cpp src/ipc/socket_connection.cpp src/memory/shared_memory.cpp src/memory/shared_memory_pool.cpp src/producer/producer_impl.cpp src/service/service_impl.cpp src/consumer/consumer_impl.cpp -o perfetto_demo -lrt -pthread
+```
+
+```
+Ubuntu18.04
+```
+
+---
+
+_**User**_
+
+
+
+---
+
+_**Assistant**_
+
+I see another similar `const` qualifier issue in the `ServiceImpl` class. The `GetRegisteredDataSources()` method is marked as `const` but tries to lock a non-`mutable` mutex. Let me fix that:
+
+---
+
+```diff
+      
+      // 注册的数据源
+-     std::mutex sources_mutex_;
++     mutable std::mutex sources_mutex_;
+      std::vector<RegisteredDataSource> registered_sources_;
+      
+```
+
+---
+
+I also noticed some unused variables warnings in the service implementation. Let's fix those:
+
+---
+
+Cancelled
+
+---
+
 
 
 ---

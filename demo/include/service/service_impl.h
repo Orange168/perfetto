@@ -89,7 +89,7 @@ private:
     std::vector<ClientConnection> clients_;
     
     // 注册的数据源
-    std::mutex sources_mutex_;
+    mutable std::mutex sources_mutex_;
     std::vector<RegisteredDataSource> registered_sources_;
     
     // 追踪会话状态

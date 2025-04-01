@@ -54,5 +54,5 @@ private:
     void Initialize();
     
     // 查找一个可用的块
-    int FindFreeChunkLocked();
+    int FindFreeChunkLocked() const;
 }; 
