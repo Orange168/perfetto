@@ -9,6 +9,7 @@
 .deps_sha1
 .DS_Store
 .env
+*.o
 .eslintcache
 .gclient*
 .gm-actuals
